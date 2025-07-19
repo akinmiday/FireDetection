@@ -1,33 +1,51 @@
-﻿using OpenCvSharp;
+﻿// File: Program.cs
+using System;
+using System.IO;
+using System.Collections.Generic;
+using Microsoft.Extensions.Configuration;
+using OpenCvSharp;
 
 namespace FireDetectionApp
 {
     class Program
     {
-        // Shared constants
-        const int IN_W = 640, IN_H = 640;
-        const float CONF_THRESH = 0.5f;
-        const float IOU_THRESH  = 0.45f;
-
         static void Main()
         {
-            // 1) Compose pipeline components
-            using var source       = new CameraFrameSource();
-            var preprocessor       = new FramePreprocessor(IN_W, IN_H);
-            using var detector     = new OnnxFireDetector("Models/fire_detection.onnx");
-            var postprocessor      = new DetectionPostProcessor(CONF_THRESH, IOU_THRESH, IN_W, IN_H);
-            var renderer           = new FrameRenderer();
-            var alerts             = new ConsoleAlertService();
-            var flickerFilter      = new FlickerFilter(threshold: 3.0);
+            // 1) Load configuration
+            var config = new ConfigurationBuilder()
+                .SetBasePath(Directory.GetCurrentDirectory())
+                .AddJsonFile("appsettings.json", optional: false)
+                .Build();
+            var settings = config.Get<AppSettings>() 
+                         ?? throw new InvalidOperationException("appsettings.json missing or malformed");
 
-            // 2) Snapshot folder & throttle setup
-            var snapshotDir        = Path.Combine(Environment.CurrentDirectory, "Snapshots");
+            // 2) Unpack settings
+            int    IN_W            = settings.Input.Width;
+            int    IN_H            = settings.Input.Height;
+            float  CONF_THRESH     = settings.Thresholds.Confidence;
+            float  IOU_THRESH      = settings.Thresholds.IoU;
+            double FLICKER_THRESH  = settings.Thresholds.Flicker;
+            string MODEL_PATH      = settings.ModelPath;
+            string SNAPSHOT_DIR    = settings.SnapshotDirectory;
+            TimeSpan THROTTLE_INT  = TimeSpan.FromSeconds(settings.ThrottleIntervalSeconds);
+            string FRAME_SOURCE    = settings.FrameSource.Source;
+
+            // 3) Compose pipeline with configured source
+            using IFrameSource source      = new CameraFrameSource(FRAME_SOURCE);
+            var preprocessor               = new FramePreprocessor(IN_W, IN_H);
+            using var detector             = new OnnxFireDetector(MODEL_PATH);
+            var postprocessor              = new DetectionPostProcessor(CONF_THRESH, IOU_THRESH, IN_W, IN_H);
+            var renderer                   = new FrameRenderer();
+            var alerts                     = new ConsoleAlertService();
+            var flickerFilter              = new FlickerFilter(FLICKER_THRESH);
+
+            // 4) Prepare snapshot folder & throttle timers
+            var snapshotDir                = Path.Combine(Directory.GetCurrentDirectory(), SNAPSHOT_DIR);
             Directory.CreateDirectory(snapshotDir);
-            var snapshotInterval   = TimeSpan.FromSeconds(5);
-            DateTime lastSnapshot  = DateTime.MinValue;
+            DateTime lastSnapshot          = DateTime.MinValue;
+            DateTime lastAlert             = DateTime.MinValue;
 
             Console.WriteLine("▶️ Press ESC to quit");
-
             while (true)
             {
                 if (!source.TryGetFrame(out var frame))
@@ -35,53 +53,40 @@ namespace FireDetectionApp
 
                 var now = DateTime.Now;
 
-                // 3) Flicker check
-                bool flicker = flickerFilter.HasFlicker(frame);
-                Console.WriteLine($"[Debug] Flicker check: {flicker:True/False}");
+                // 5) Inference every frame
+                var tensor     = preprocessor.Process(frame);
+                var rawOutput  = detector.Run(tensor, out int numDet);
+                var detections = postprocessor.Process(rawOutput, numDet, frame.Size());
 
-                var detections = new List<Detection>();
-
-                if (flicker)
+                // 6) If we see real fire *and* the scene is flickering, throttle alerts/snapshots
+                if (detections.Count > 0 && flickerFilter.HasFlicker(frame))
                 {
-                    // 4) Run inference every time we see flicker
-                    Console.WriteLine("[Debug] Running ONNX inference…");
-                    var tensor = preprocessor.Process(frame);
-                    var raw    = detector.Run(tensor, out int numDet);
-                    detections = postprocessor.Process(raw, numDet, frame.Size());
-                    Console.WriteLine($"[Debug] Raw detections: {detections.Count}");
-                }
-                else
-                {
-                    Console.WriteLine("[Debug] Skipping inference (no flicker)");
-                }
+                    if (now - lastAlert >= THROTTLE_INT)
+                    {
+                        alerts.Alert(detections);
+                        lastAlert = now;
+                    }
 
-                // 5) Alert & snapshot throttle
-                if (detections.Count > 0)
-                {
-                    alerts.Alert(detections);
-
-                    if (now - lastSnapshot >= snapshotInterval)
+                    if (now - lastSnapshot >= THROTTLE_INT)
                     {
                         var fn = Path.Combine(
                             snapshotDir,
                             $"fire_{now:yyyyMMdd_HHmmss}.jpg"
                         );
                         Cv2.ImWrite(fn, frame);
-                        Console.WriteLine($"[Debug] Saved snapshot: {fn}");
                         lastSnapshot = now;
-                    }
-                    else
-                    {
-                        Console.WriteLine($"[Debug] Detected but throttled snapshot (next in {(snapshotInterval - (now - lastSnapshot)).TotalSeconds:0.0}s)");
                     }
                 }
 
-                // 6) Draw & display
+                // 7) Draw & display
                 renderer.Render(frame, detections);
 
                 if (Cv2.WaitKey(1) == 27)  // ESC
                     break;
             }
+
+            // 8) Clean up OpenCV windows
+            Cv2.DestroyAllWindows();
         }
     }
 }
