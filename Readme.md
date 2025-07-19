@@ -1,6 +1,6 @@
 # FireDetectionApp
 
-A modular C# application for real‑time fire detection using ONNX and OpenCvSharp.
+An Open source modular C# application for real‑time fire detection using ONNX and OpenCvSharp.
 
 ## Table of Contents
 
